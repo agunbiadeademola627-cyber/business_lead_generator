@@ -1,7 +1,9 @@
 import streamlit as st
 import pandas as pd
 import requests
+import re
 import time
+from bs4 import BeautifulSoup
 
 st.set_page_config(page_title="Live Lead Generator", page_icon="🎯", layout="wide")
 
@@ -17,6 +19,9 @@ HEADERS = {"User-Agent": "LeadGenDashboard/1.0 (personal lead-gen tool)"}
 
 NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
 OVERPASS_URL = "https://overpass-api.de/api/interpreter"
+
+EMAIL_PATTERN = r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}'
+PHONE_PATTERN = r'\+?\d[\d\-\s\(\)]{8,14}\d'
 
 
 # ---------- Step 1: turn a location string into a bounding box ----------
@@ -86,6 +91,83 @@ def nominatim_direct_search(name, max_results=10):
         return resp.json()
     except Exception:
         return []
+
+
+# ---------- Step 4: enrich missing contact info from the business's own website ----------
+
+def extract_emails(text):
+    emails = set(re.findall(EMAIL_PATTERN, text))
+    emails = {e for e in emails if not re.search(r'\.(png|jpg|jpeg|gif|svg|webp)$', e, re.I)}
+    return sorted(emails)
+
+
+def extract_phones(text):
+    raw_phones = re.findall(PHONE_PATTERN, text)
+    clean = set()
+    for p in raw_phones:
+        digits_only = re.sub(r'\D', '', p)
+        if 7 <= len(digits_only) <= 15:
+            clean.add(p.strip())
+    return sorted(clean)
+
+
+def fetch_page_text(url, timeout=8):
+    try:
+        resp = requests.get(url, headers=HEADERS, timeout=timeout)
+        if resp.status_code != 200:
+            return ""
+        soup = BeautifulSoup(resp.text, "html.parser")
+        for tag in soup(["script", "style"]):
+            tag.extract()
+        return soup.get_text(separator=" ")
+    except Exception:
+        return ""
+
+
+def find_contact_page(base_url):
+    import urllib.parse
+    parsed = urllib.parse.urlparse(base_url)
+    if not parsed.scheme:
+        base_url = "https://" + base_url
+        parsed = urllib.parse.urlparse(base_url)
+    root = f"{parsed.scheme}://{parsed.netloc}"
+    for path in ("/contact", "/contact-us", "/about", "/about-us"):
+        candidate_url = root + path
+        try:
+            resp = requests.head(candidate_url, headers=HEADERS, timeout=5, allow_redirects=True)
+            if resp.status_code == 200:
+                return candidate_url
+        except Exception:
+            continue
+    return None
+
+
+def enrich_from_website(row):
+    """If phone/email are missing but a website is known, check that site directly."""
+    website = row.get("Website")
+    if not website or website == "Not listed":
+        return row
+    if row["Phone"] != "Not listed" and row["Email"] != "Not listed":
+        return row  # already complete, skip the extra request
+
+    url = website if website.startswith("http") else "https://" + website
+    combined_text = fetch_page_text(url)
+
+    contact_url = find_contact_page(url)
+    if contact_url:
+        combined_text += " " + fetch_page_text(contact_url)
+
+    if row["Email"] == "Not listed":
+        found_emails = extract_emails(combined_text)
+        if found_emails:
+            row["Email"] = ", ".join(found_emails)
+
+    if row["Phone"] == "Not listed":
+        found_phones = extract_phones(combined_text)
+        if found_phones:
+            row["Phone"] = ", ".join(found_phones)
+
+    return row
 
 
 # ---------- Helpers to turn raw OSM tags into a clean row ----------
@@ -192,6 +274,24 @@ if run_search:
                 for res in results:
                     leads.append(row_from_nominatim_result(res))
 
+            # Enrichment pass: only for leads missing phone/email AND having a known website.
+            to_enrich = [
+                l for l in leads
+                if l.get("Website", "Not listed") != "Not listed"
+                and (l["Phone"] == "Not listed" or l["Email"] == "Not listed")
+            ]
+
+            if to_enrich:
+                status.write(
+                    f"Step extra: {len(to_enrich)} lead(s) missing contact info — "
+                    "checking their own websites directly..."
+                )
+                enrich_progress = st.progress(0)
+                for i, row in enumerate(to_enrich):
+                    enrich_from_website(row)
+                    enrich_progress.progress((i + 1) / len(to_enrich))
+                    time.sleep(0.5)  # be polite to each business's server
+
             status.update(label="Done!", state="complete")
 
         if not leads:
@@ -226,7 +326,8 @@ if run_search:
             )
 
             st.caption(
-                "Data sourced from OpenStreetMap (openstreetmap.org contributors), an open "
-                "map/business database. Contact info reflects only what's been publicly tagged there. "
-                "Always follow applicable email/marketing laws (CAN-SPAM, NDPR, GDPR, etc.) before outreach."
+                "Data sourced from OpenStreetMap (openstreetmap.org contributors). Where OSM had no "
+                "phone/email on file, this tool additionally checked that business's own listed website "
+                "for publicly posted contact details. Always follow applicable email/marketing laws "
+                "(CAN-SPAM, NDPR, GDPR, etc.) before outreach."
             )
