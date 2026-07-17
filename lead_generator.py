@@ -8,7 +8,7 @@ import urllib.parse
 
 st.set_page_config(page_title="Live Lead Generator", page_icon="🎯", layout="wide")
 
-st.title("🎯 Live Lead Generation & Extraction Tool")
+st.title("🎯Lead Generation & Extraction Tool")
 st.write(
     "Type a business name or a niche (e.g. 'logistics companies'). "
     "The tool finds real business websites and pulls the contact details "
